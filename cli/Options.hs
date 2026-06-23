@@ -22,7 +22,7 @@ newtype OutputSpec = OutputSpec FilePath
   deriving Show
 
 
-data Options = RunOptions Int DataSource TechMode (Maybe OutputSpec) TemplateSource
+data Options = RunOptions String DataSource TechMode (Maybe OutputSpec) TemplateSource
   deriving Show
 
 
@@ -36,6 +36,7 @@ data TechMode =
   | Haskell
   | Cmm
   | Ruby
+  | Elm
   deriving Show
 
 parseOptions :: [String] -> IO Options
@@ -55,18 +56,11 @@ runOptions =
   RunOptions <$> debugValue <*> dataSource <*> actionSpec <*> optional outputSpec <*> templateSource <**> helper
 
 
-debugFlags :: Parser Int
-debugFlags =
-  flag 0 1 (
-      long "debug"
-    <> help "Enable debug mode"
-  )
-
-
-debugValue :: Parser Int
+debugValue :: Parser String
 debugValue =
-  read <$> strOption (
+  strOption (
       long "debug"
+    <> short 'd'
     <> help "Enable debug mode"
     <> value "0"
   )
@@ -133,3 +127,4 @@ techMode =
     <> command "haskell" (info (pure Haskell) (progDesc "Use the Haskell template engine"))
     <> command "cmm" (info (pure Cmm) (progDesc "Use the CMM template engine"))
     <> command "ruby" (info (pure Ruby) (progDesc "Use the Ruby template engine"))
+    <> command "elm" (info (pure Elm) (progDesc "Use the Elm template engine"))

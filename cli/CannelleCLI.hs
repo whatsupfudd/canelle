@@ -63,9 +63,14 @@ import Cannelle.React.Transpiler.ElmGen (makeElmCode)
 import Cannelle.React.Transpiler.AnalyzeAst (analyzeAst, AnalyzeResult (..))
 import qualified Cannelle.Ruby.Parse as Rb
 
+import qualified Cannelle.Elm.Parse as Elm
+import qualified Cannelle.Elm.Print as ElmP
+import Cannelle.Elm.Resolve (resolveApi)
+
 import qualified Cannelle.FileUnit.InOut as Fio
 
 import Options (parseOptions, Options (..), TemplateSource (..), DataSource (..), TechMode (..), OutputSpec (..))
+import Text.Read (readMaybe)
 
 
 main :: IO ()
@@ -74,7 +79,12 @@ main = do
     options <- parseOptions args
     putStrLn $ "@[main] options: " <> show options
     case options of
-      RunOptions rtOpts dat tech mbOut tpl -> do
+      RunOptions strOpts dat tech mbOut tpl -> 
+        let
+          rtOpts = case readMaybe strOpts of
+            Just n -> n
+            Nothing -> 0
+        in
         case tech of
           Jinja -> runJinja tpl dat
           Hugo -> runHugo tpl dat mbOut
@@ -85,6 +95,7 @@ main = do
           Haskell -> runHaskell rtOpts tpl dat
           Cmm -> runCmm rtOpts tpl dat
           Ruby -> runRuby rtOpts tpl dat
+          Elm -> runElm rtOpts tpl dat
 
 
 loadData :: DataSource -> IO (Either YAML.ParseException (HashMap Text JSON.Value))
@@ -284,6 +295,22 @@ runRuby rtOpts tplSrc dataSrc = do
           putStrLn $ "@[runRuby] got context."
   pure ()
 
+
+runElm :: Int -> TemplateSource -> DataSource -> IO ()
+runElm rtOpts tplSrc dataSrc = do
+  rezA <- case tplSrc of
+    TemplateFromFile fileName -> do
+      rezB <- Elm.parse (rtOpts > 0) fileName
+      case rezB of
+        Left errMsg -> putStrLn $ "@[runElm] parse err: " <> show errMsg
+        Right ctx -> do
+          putStrLn $ "@[runElm] got context."
+          content <- Bs.readFile fileName
+          {-
+          ElmP.printApi content (resolveApi fileName ctx)
+          -}
+          ElmP.printContext content False fileName ctx
+  pure ()
 
 printParserError :: Maybe String -> ParserError -> IO ()
 printParserError srcMay = putStrLn . formatParserError srcMay

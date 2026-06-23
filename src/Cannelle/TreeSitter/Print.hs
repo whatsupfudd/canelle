@@ -1,13 +1,13 @@
 module Cannelle.TreeSitter.Print where
 
 import qualified Data.ByteString as Bs
-import Data.Text (unpack)
-import Data.Text.Encoding (decodeUtf8)
+import Data.Text (Text, unpack, pack)
+import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 import qualified Data.Vector as V
 
 import TreeSitter.Node ( Node(..), TSPoint(TSPoint, pointRow, pointColumn) )
 
-import Cannelle.TreeSitter.Types
+import Cannelle.TreeSitter.Types (NodeEntry (..), SegmentPos (..), showRange)
 
 
 printNode :: Int -> NodeEntry -> IO ()
@@ -74,6 +74,20 @@ fetchContent cLines (sPos@(start, end), lineNum) =
     endCol = fromIntegral end.pointColumn
   in
   show lineNum <> " (" <> show startLine <> "," <> show startCol <> ")-(" <> show endLine <> "," <> show endCol <> "): " <> (unpack . decodeUtf8) mainText <> "\n"
+
+
+fetchContentBs :: V.Vector Bs.ByteString -> (SegmentPos, Int) -> Bs.ByteString
+fetchContentBs cLines (sPos@(start, end), lineNum) =
+  let
+    mainText = fetchContentRaw cLines sPos
+    startLine = fromIntegral start.pointRow
+    startCol = fromIntegral start.pointColumn
+    endLine = fromIntegral end.pointRow
+    endCol = fromIntegral end.pointColumn
+  in
+  -- " (" <> (encodeUtf8 . pack) (show startLine <> "," <> show startCol <> ")-(" <> show endLine <> "," <> show endCol <> "): ")
+  -- <>
+  mainText
 
 
 fetchContentRaw :: V.Vector Bs.ByteString -> SegmentPos -> Bs.ByteString
