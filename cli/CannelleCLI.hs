@@ -51,6 +51,7 @@ import qualified Cannelle.Templog.Parse as Tp
 import qualified Cannelle.Templog.Exec as Te
 import qualified Cannelle.Fuddle.Parse as Fd
 import qualified Cannelle.Haskell.Parse as Hs
+import qualified Cannelle.Haskell.Summary.Print as HsP
 import qualified Cannelle.Cmm.Parse as Cmm
 import qualified Cannelle.PHP.Parse as Ph
 import Cannelle.PHP.Print (printPhpContext)
@@ -77,7 +78,7 @@ main :: IO ()
 main = do
     args <- getArgs
     options <- parseOptions args
-    putStrLn $ "@[main] options: " <> show options
+    -- putStrLn $ "@[main] options: " <> show options
     case options of
       RunOptions strOpts dat tech mbOut tpl -> 
         let
@@ -261,12 +262,12 @@ runHaskell :: Int -> TemplateSource -> DataSource -> IO ()
 runHaskell rtOpts tplSrc dataSrc = do
   rezA <- case tplSrc of
     TemplateFromFile fn -> do
-      rezB <- Hs.parse (rtOpts > 0) fn
+      putStrLn $ "Top level description for file: " <> fn
+      -- rezB <- Hs.parse (rtOpts > 0) fn
+      rezB <- Hs.parseSummary (rtOpts > 0) fn
       case rezB of
-        Left errMsg ->
-          putStrLn $ "@[runHaskell] tsParseHaskell err: " <> show errMsg
-        Right ctx -> do
-          putStrLn "@[runHaskell] got context."
+        Left errMsg -> putStrLn $ "@[runHaskell] parseSummary err: " <> show errMsg
+        Right ctxt -> HsP.printModuleSummary ctxt
     TemplateFromStdin ->
       putStrLn "@[runHaskell] TemplateFromStdin not supported yet."
   pure ()

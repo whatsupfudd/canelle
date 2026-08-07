@@ -28,7 +28,8 @@ import Cannelle.TreeSitter.Print (printNode)
 import Cannelle.Haskell.AST (HaskellContext (..))
 import Cannelle.Haskell.Parser (haskellScanner)
 import Cannelle.Haskell.Print (printContext)
-
+import Cannelle.Haskell.Summary (summarizeModule)
+import Cannelle.Haskell.Summary.Types (HaskellModuleSummary)
 
 parse :: Bool -> FilePath -> IO (Either CompError HaskellContext)
 parse rtOpts path = do
@@ -63,5 +64,17 @@ parseTsAst content debugMode children count = do
       when debugMode $ printContext content context
       pure $ Right context
 
-    
+
+parseSummary :: Bool -> FilePath -> IO (Either CompError HaskellModuleSummary)
+parseSummary debugMode filePath = do
+  content <- Bs.readFile filePath
+  result <- parseFromContent debugMode filePath content Nothing
+  pure $ summarizeModule content <$> result
+
+
+parseSummaryFromContent :: Bool -> FilePath -> Bs.ByteString -> Maybe FilePath
+    -> IO (Either CompError HaskellModuleSummary)
+parseSummaryFromContent debugMode filePath content mbOutPath = do
+  result <- parseFromContent debugMode filePath content mbOutPath
+  pure $ summarizeModule content <$> result
 

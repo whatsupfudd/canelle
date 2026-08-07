@@ -22,42 +22,330 @@ data HaskellContext = HaskellContext {
 
 data ModuleDef = ModuleDef {
     name :: [Identifier]
-    , exportedSymbols :: V.Vector ExposedSymbol
+    , exports :: ExportSpec
+    , unknownDecls :: [Declaration]
   }
+  deriving Show
+
+
+data ExportSpec =
+    AllES
+  | OnlyES (V.Vector ExposedSymbol)
   deriving Show
 
 
 data Import = Import {
     moduleName :: [Identifier]
-    , qualified :: Bool
+    , packageQualifier :: Maybe Int
+    , qualification :: ImportQualification
     , alias :: Maybe [Identifier]
-    , exposing :: V.Vector ExposedSymbol
+    , importSpec :: ImportSpec
+    , safeImport :: Bool
+    , sourceImport :: Bool
+    , unknownImportDecls :: [Declaration]
   }
+  deriving Show
+
+
+data ImportQualification =
+    UnqualifiedIQ
+  | PreQualifiedIQ
+  | PostQualifiedIQ
+  | PreAndPostQualifiedIQ
+  deriving Show
+
+
+data ImportSpec =
+    AllIS
+  | OnlyIS (V.Vector ExposedSymbol)
+  | HidingIS (V.Vector ExposedSymbol)
   deriving Show
 
 
 data Declaration =
-  SignatureDC Int TypeAnnotation
+    SignatureDC (V.Vector SignatureName) TypeAnnotation
+  | KindSignatureDC SignatureName TypeAnnotation
   | FunctionDC FunctionContent
-  | BindingDC BindContent
+  | BindingDC PatternBinding
   | TopSpliceDC Expression
   | CommentDC
-  | DataDC
-  | TypeSynonymDC
-  | NewtypeDC
-  | ClassDC
+  | DataDC DataDeclaration
+  | TypeSynonymDC TypeSynonymDeclaration
+  | NewtypeDC NewtypeDeclaration
+  | ClassDC ClassDeclaration
+  | FamilyDC FamilyDeclaration
   | InstanceDC
   | DefaultDC
   | ForeignDC
   | PostImportDC Import
+  | UnknownDC String SegmentPos
   deriving Show
 
 
-data FunctionContent = FunctionContent { 
-    name :: Int
-    , pattern :: V.Vector Int
-    , body :: [MatchContent]
+data SignatureName =
+    VariableSN Int
+  | TypeSN Int
+  | ConstructorSN Int
+  | OperatorSN Int
+  | ConstructorOperatorSN Int
+  deriving Show
+
+
+data TypeHead = TypeHead {
+    nameTH :: Identifier
+    , parametersTH :: [TypeParameter]
+    , contextTH :: Maybe TypeContext
+    , kindTH :: Maybe TypeAnnotation
   }
+  deriving Show
+
+
+data TypeParameter = TypeParameter {
+    parameterTP :: TypeAnnotation
+    , kindTP :: Maybe TypeAnnotation
+  }
+  deriving Show
+
+
+data DataDeclaration = DataDeclaration {
+    headDC :: TypeHead
+    , constructorsDC :: [DataConstructor]
+    , derivingDC :: [DerivingDecl]
+    , unknownDC :: [Declaration]
+  }
+  deriving Show
+
+
+data NewtypeDeclaration = NewtypeDeclaration {
+    headNT :: TypeHead
+    , constructorNT :: DataConstructor
+    , derivingNT :: [DerivingDecl]
+    , unknownNT :: [Declaration]
+  }
+  deriving Show
+
+
+data TypeSynonymDeclaration = TypeSynonymDeclaration {
+    headTS :: TypeHead
+    , valueTS :: TypeAnnotation
+  }
+  deriving Show
+
+
+data ClassDeclaration = ClassDeclaration {
+    headCL :: TypeHead
+    , declarationsCL :: V.Vector Declaration
+    , unknownCL :: [Declaration]
+  }
+  deriving Show
+
+
+data FamilyKind = TypeFK | DataFK
+  deriving Show
+
+
+data FamilyDeclaration = FamilyDeclaration {
+    familyKindFD :: FamilyKind
+    , headFD :: TypeHead
+    , unknownFD :: [Declaration]
+  }
+  deriving Show
+
+
+data DerivingStrategy = StockDS | NewtypeDS | AnyclassDS
+  deriving Show
+
+
+data DerivingDecl = DerivingDecl {
+    strategyDD :: Maybe DerivingStrategy
+    , classesDD :: [TypeAnnotation]
+    , viaDD :: Maybe TypeAnnotation
+  }
+  deriving Show
+
+
+data DataConstructor =
+    ClassicCns (Identifier, [TypeAnnotation])
+  | RecordCns (Identifier, [DataConstructorField])
+  | SumCns SumDecl
+  | UnknownCns String SegmentPos
+  deriving Show
+
+
+data SumDecl = SumDecl {
+    nameCns :: Identifier
+    , contentCns :: [TypeAnnotation]
+  }
+  deriving Show
+
+
+data DataConstructorField = DataConstructorField {
+    nameFld :: Identifier
+    , typeFld :: TypeAnnotation
+  }
+  deriving Show
+
+
+
+data FunctionName =
+    VariableFN Int
+  | OperatorFN Operator
+  deriving Show
+
+
+data FunctionContent = FunctionContent {
+    nameFC :: FunctionName
+    , patternsFC :: V.Vector Pattern
+    , matchesFC :: [MatchContent]
+    , localBindsFC :: [LocalBinding]
+  }
+  deriving Show
+
+
+data PatternBinding = PatternBinding {
+    patternBD :: Pattern
+    , matchesBD :: [MatchContent]
+    , localBindsBD :: [LocalBinding]
+  }
+  deriving Show
+
+
+data MatchContent = MatchContent {
+    guardsMC :: [GuardContent]
+    , valueMC :: Expression
+  }
+  deriving Show
+
+
+data GuardContent =
+    BooleanGuardGC Expression
+  | PatternGuardGC Pattern Expression
+  | LetGuardGC [LocalBinding]
+  | UnknownGuardGC String SegmentPos
+  deriving Show
+
+
+data Pattern =
+    VariablePT Int
+  | ConstructorPT Identifier
+  | ApplyPT Pattern Pattern
+  | InfixPT Pattern Operator Pattern
+  | LiteralPT Literal
+  | NegativePT Literal
+  | WildcardPT Int
+  | ParenPT Pattern
+  | TuplePT [Pattern]
+  | ListPT [Pattern]
+  | UnitPT
+  | AsPT Int Pattern
+  | IrrefutablePT Pattern
+  | StrictPT Pattern
+  | RecordPT Pattern [RecordPatternField]
+  | ViewPT Expression Pattern
+  | PatternSignaturePT Pattern TypeAnnotation
+  | UnknownPT String SegmentPos
+  | PatternWithComments Pattern [Int] [Int]
+  deriving Show
+
+
+data RecordPatternField =
+    FieldPatternRPF Identifier (Maybe Pattern)
+  | RecordWildcardRPF
+  deriving Show
+
+
+data Operator =
+    VariableOP Int
+  | ConstructorOP Int
+  | QualifiedOP Identifier
+  | BackquotedOP Identifier
+  deriving Show
+
+
+data LocalBinding =
+    LocalFunctionLB FunctionContent
+  | LocalPatternLB PatternBinding
+  | LocalSignatureLB (V.Vector SignatureName) TypeAnnotation
+  | LocalCommentLB Int
+  | LocalUnknownLB String SegmentPos
+  deriving Show
+
+
+data DoStatementHskl =
+    BindST BindContent
+  | LetShortST [LocalBinding]
+  | ExpressionST Expression
+  | CommentST Int
+  | UnknownST String SegmentPos
+  deriving Show
+
+
+data BindContent = BindContent {
+    operator :: BindOperator
+    , leftSide :: Pattern
+    , rightSide :: Expression
+  }
+  deriving Show
+
+
+data BindOperator = EquateBO | MonadicBO
+  deriving Show
+
+
+data AlternativeCmt =
+  RealAlternative Alternative
+  | CommentAlternative Int
+  deriving Show
+
+data Alternative = Alternative {
+    patternALT :: Pattern
+    , guardsALT :: [GuardContent]
+    , valueALT :: Expression
+    , localBindsALT :: [LocalBinding]
+  }
+  deriving Show
+
+
+data RecordField = RecordField {
+    nameRF :: Identifier
+    , valueRF :: Maybe Expression
+  }
+  deriving Show
+
+
+data Quasiquote = Quasiquote {
+    quoterQQ :: Identifier
+    , bodyQQ :: Int
+  }
+  deriving Show
+
+
+data Expression =
+    ApplyEX Expression Expression
+  | InfixEX Expression Operator Expression
+  | LiteralEX Literal
+  | NegateEX Expression
+  | DoEX [DoStatementHskl]
+  | CaseEX Expression [AlternativeCmt]
+  | IfThenElseEX Expression Expression Expression
+  | LambdaEX (V.Vector Pattern) Expression
+  | VariableEX Int
+  | QualifiedEX Identifier
+  | ProjectionEX Expression Identifier
+  | LetInEX [LocalBinding] Expression
+  | RecordEX Expression [RecordField]
+  | LeftSectionEX Expression Operator
+  | RightSectionEX Operator Expression
+  | SignatureEX Expression TypeAnnotation
+  | QuasiquoteEX Quasiquote
+  | ConstructorEX Int
+  | OperatorEX Operator
+  | ParenEX Expression
+  | ListEX [Expression]
+  | TupleEX [Expression]
+  | VoidEX
+  | UnknownEX String SegmentPos
+  | ExprWithComments Expression [Int] [Int]
   deriving Show
 
 
@@ -117,52 +405,63 @@ data NumericType =
   deriving Show
 
 
--- TODO
-data TypeContext =
-  SimpleTC TypeAnnotation
-  | ParenTC TypeAnnotation
-  | TupleTC (V.Vector TypeAnnotation)
+data TypeContext = TypeContext {
+    constraintsTC :: [TypeAnnotation]
+  }
+  deriving Show
+
+
+data TypeOperator =
+    OperatorTO Int
+  | ConstructorOperatorTO Int
+  | NamedOperatorTO Identifier
+  deriving Show
+
+
+data TypeLiteral =
+    IntegerTL Int
+  | StringTL Int
+  | CharTL Int
+  deriving Show
+
+
+data TypeAnnotation =
+    NameTA Identifier
+  | OperatorTA TypeOperator
+  | FunctionTA TypeAnnotation TypeAnnotation
+  | ApplyTA TypeAnnotation TypeAnnotation
+  | InfixTA TypeAnnotation TypeOperator TypeAnnotation
+  | ParenTA TypeAnnotation
+  | VoidTA
+  | ListTA TypeAnnotation
+  | TupleTA [TypeAnnotation]
+  | ContextTA TypeContext TypeHead -- TypeAnnotation
+  | ForallTA [TypeParameter] TypeAnnotation
+  | KindTA TypeAnnotation TypeAnnotation
+  | WildcardTA Int
+  | LiteralTA TypeLiteral
+  | UnknownTA String SegmentPos
+  deriving Show
+
+
+
+data SymbolNamespace =
+    TypeNS
+  | PatternNS
   deriving Show
 
 
 data ExposedSymbol =
-  TypeName Int
+    TypeName Int
   | VarName Int
   | ConstructorName Int
+  | OperatorName Int
+  | ConstructorOperatorName Int
+  | ModuleNameEV [Identifier]
+  | NamespacedEV SymbolNamespace ExposedSymbol
   | DoubleDotEV
   | ComplexDef ExposedSymbol (V.Vector ExposedSymbol)
   deriving Show
-
-
-data DoStatementHskl = 
-    BindST BindContent
-  | CommentST Int
-  | LetShortST [LetBinding]
-  | ExpressionST Expression
-  deriving Show
-
-
-data MatchContent = MatchContent [GuardContent] Expression
-  deriving Show
-
-
-data GuardContent =
-  BooleanGuardGC Expression
-  | BindingGuardGC [BindContent]
-  deriving Show
-
-data BindContent = BindContent {
-    operator :: BindOperator
-    , leftSide :: Expression
-    , rightSide :: Expression
-  }
-  deriving Show
-
-data BindOperator =
-  EquateBO
-  | MonadicBO
-  deriving Show
-
 
 
 data LetShortContent = LetShortContent {
@@ -172,46 +471,9 @@ data LetShortContent = LetShortContent {
   deriving Show
 
 
-data TypeAnnotation =
-  NameTA Identifier
-  | FunctionTA TypeAnnotation TypeAnnotation
-  | ApplyTA TypeAnnotation TypeAnnotation
-  | ParenTA TypeAnnotation
-  | VoidTA
-  | ListTA TypeAnnotation
-  | ContextTA (Maybe Int) TypeContext TypeAnnotation
-  deriving Show
-
-
-data Expression =
-  ApplyEX Expression Expression
-  | InfixEX Expression Int Expression
-  | LiteralEX Literal
-  | DoEX [DoStatementHskl]
-  | CaseEX Expression [Alternative]
-  | IfThenElseEX Expression Expression Expression
-  | VariableEX Int
-  | QualifiedEX Identifier
-  | ProjectionEX Expression Expression
-  | LetInEX [LetBinding] Expression
-  | QuasiquoteEX
-  | ConstructorEX Int
-  | ParenEX Expression
-  | ListEX [Expression]
-  | TupleEX [Expression]
-  | VoidEX
-  deriving Show
-
 data LetBinding = 
   SimpleLB BindContent
   | FunctionLB FunctionContent
-  deriving Show
-
-
-data Alternative = Alternative {
-    guard :: Expression
-    , value :: Expression
-  }
   deriving Show
 
 

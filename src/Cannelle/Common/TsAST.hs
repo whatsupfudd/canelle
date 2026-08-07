@@ -30,7 +30,7 @@ tryParseFromContent debugMode parser toLanguageAst path content = do
   start <- getCurrentTime
   tree <- ts_parser_parse_string parser nullPtr cStr strLen
   end <- getCurrentTime
-  putStrLn $ "@[tryParseFromContent] ts_parser_parse_string time: " <> show (diffUTCTime end start)
+  when debugMode $ putStrLn $ "@[tryParseFromContent] ts_parser_parse_string time: " <> show (diffUTCTime end start)
 
   mem <- malloc
   ts_tree_root_node_p tree mem

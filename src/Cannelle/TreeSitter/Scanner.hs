@@ -458,6 +458,12 @@ single t = token testToken expected
   expected = E.singleton (Tokens (buildFakeNodeEntry t :| []))
 
 
+anyNode :: (MonadScanner e m) => m NodeEntry
+anyNode = token testToken E.empty
+  where
+  testToken x = Just x
+
+
 singleP :: (MonadScanner e m) => String -> m NodeEntry
 singleP t = tokenPush testToken expected
   where

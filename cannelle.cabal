@@ -64,9 +64,17 @@ library
       Cannelle.Haskell.AST
       Cannelle.Haskell.Parse
       Cannelle.Haskell.Parser
+      Cannelle.Haskell.Parser.Computations
+      Cannelle.Haskell.Parser.Names
+      Cannelle.Haskell.Parser.Recovery
       Cannelle.Haskell.Parser.Statements
+      Cannelle.Haskell.Parser.TypeAnnotations
       Cannelle.Haskell.Parser.Types
       Cannelle.Haskell.Print
+      Cannelle.Haskell.Summary
+      Cannelle.Haskell.Summary.Print
+      Cannelle.Haskell.Summary.Resolve
+      Cannelle.Haskell.Summary.Types
       Cannelle.Haskell.Types
       Cannelle.Html.Parser
       Cannelle.Html.Render

@@ -2,13 +2,15 @@ module Cannelle.Haskell.Parser.Statements where
 
 import Control.Applicative (asum, many, some, (<|>))
 import Control.Applicative.Combinators (optional)
-import Control.Monad (when, void, fail)
+import Control.Monad (void)
 
 import Data.Functor (($>))
+import Data.List (foldl', singleton)
 import Data.Maybe (fromMaybe, isJust)
 import qualified Data.Vector as V
 
 import qualified Cannelle.TreeSitter.Scanner as S
+import Cannelle.TreeSitter.Types (NodeEntry(..))
 import Cannelle.Parser.Debug (debugOpt)
 
 import Cannelle.Haskell.AST
@@ -16,459 +18,754 @@ import Cannelle.Haskell.Parser.Types
 import Cannelle.VM.Context (ModuleRepo(modules))
 import Cannelle.PHP.Parser.Expressions (nameS)
 import Cannelle.React.Transpiler.AnalyzeAst (DescendState(imports))
-import Cannelle.TreeSitter.Debug (ScannerDebug(debug))
+import Cannelle.Haskell.Parser.Recovery ( unknownDeclS, unhandledAs, spanNE )
+import Cannelle.Haskell.Parser.TypeAnnotations (
+    contextSignatureS, typeHeadFromAnnotation, typeParametersS, typeSignatureS, typeHeadS, directTypeHeadS
+  )
+import Cannelle.Haskell.Parser.Computations (functionDeclS, patternBindingS, topSpliceS)
+
+
+data RootItem =
+    ModuleRI ModuleDef
+  | ImportsRI (V.Vector Import) (V.Vector Declaration)
+  | DeclarationsRI (V.Vector Declaration)
+  | UnknownRI Declaration
+
+
+data ImportItem =
+    ImportII Import
+  | ImportUnknownII Declaration
+
+
+data ExposedItem =
+    KnownEI ExposedSymbol
+  | UnknownEI Declaration
+
+
+data ConstructorItem =
+    ConstructorCI DataConstructor
+  | ConstructorUnknownCI Declaration
+  | ConstructorSeparatorCI
+
+
+data DeclarationTailItem =
+    DerivingTI DerivingDecl
+  | TailUnknownTI Declaration
 
 
 haskellS :: ScannerP HaskellContext
 haskellS = do
-  moduleDecl <- moduleDeclS
-  imports <- optional importListS
-  declarations <- optional declarationsS
-
+  rootItems <- many rootItemS
+  let
+    initialState = (Nothing, V.empty, V.empty)
+    (mbModuleDef, imports, declarations) = foldl' collectRootItem initialState rootItems
   pure HaskellContext {
-    moduleDef = moduleDecl
-    , imports = fromMaybe V.empty imports
-    , declarations = fromMaybe V.empty declarations
+      moduleDef = fromMaybe implicitModuleDef mbModuleDef
+    , imports = imports
+    , declarations = declarations
     , contentDemands = V.empty
-  }
+    }
+
+
+rootItemS :: ScannerP RootItem
+rootItemS =
+  asum [
+      ModuleRI <$> moduleDeclS
+    , do
+        (imports, unknowns) <- importListS
+        pure $ ImportsRI imports unknowns
+    , DeclarationsRI <$> declarationsS
+    , UnknownRI <$> unknownDeclS
+    ]
+
+
+collectRootItem :: (Maybe ModuleDef, V.Vector Import, V.Vector Declaration) -> RootItem
+    -> (Maybe ModuleDef, V.Vector Import, V.Vector Declaration)
+collectRootItem state rootItem =
+  case (state, rootItem) of
+    ((Nothing, imports, declarations), ModuleRI moduleDef) ->
+      (Just moduleDef, imports, declarations)
+    ((mbModuleDef, imports, declarations), ModuleRI _) ->
+      -- A second header should only occur in malformed input. The first
+      -- successfully parsed header remains authoritative.
+      (mbModuleDef, imports, declarations)
+
+    ((mbModuleDef, imports, declarations), ImportsRI newImports unknowns) ->
+      ( mbModuleDef, imports <> newImports, declarations <> unknowns )
+
+    ((mbModuleDef, imports, declarations), DeclarationsRI newDeclarations) ->
+      ( mbModuleDef, imports, declarations <> newDeclarations )
+
+    ((mbModuleDef, imports, declarations), UnknownRI declaration) ->
+      ( mbModuleDef, imports, V.snoc declarations declaration )
+
+
+-- | Temporary representation of a Haskell module with no explicit header.
+--
+-- An empty module-name path means the implicit Main module. This avoids
+-- manufacturing an Int symbol that does not refer to contentDemands.
+implicitModuleDef :: ModuleDef
+implicitModuleDef =
+  ModuleDef {
+      name = []
+    , exports = AllES
+    , unknownDecls = []
+    }
 
 
 moduleDeclS :: ScannerP ModuleDef
 moduleDeclS = do
-  headers <- debugOpt "md-headers" headerS
-  pure $ ModuleDef {
-      name = headers
-      , exportedSymbols = V.empty
+  (moduleName, exportSpec, unknowns) <- debugOpt "md-header" headerS
+  pure ModuleDef {
+      name = moduleName
+    , exports = exportSpec
+    , unknownDecls = unknowns
     }
 
 
-headerS :: ScannerP [Identifier]
+headerS :: ScannerP ( [Identifier], ExportSpec, [Declaration])
 headerS = do
   debugOpt "hd-header" $ S.singleP "header"
   debugOpt "hd-module" $ S.single "module"
   moduleName <- debugOpt "hd-moduleId" moduleNameS
-  -- optional (<exports>)
+  mbExports <- optional $ debugOpt "hd-exports" exportSpecS
   S.single "where"
-  pure moduleName
+  let
+    (exportSpec, unknowns) = fromMaybe (AllES, []) mbExports
+  pure (moduleName, exportSpec, unknowns)
 
 
-importListS :: ScannerP (V.Vector Import)
+exportSpecS :: ScannerP ( ExportSpec, [Declaration] )
+exportSpecS = do
+  singlePAny [ "exports", "export_list" ]
+  S.single "("
+  items <- exposedItemS exportNameS `S.sepBy` S.single ","
+  S.single ")"
+  let
+    (symbols, unknowns) = collectExposedItems items
+  pure (OnlyES symbols, unknowns)
+
+
+exportNameS :: ScannerP ExposedSymbol
+exportNameS =
+  asum [
+      do
+        singlePAny [ "export", "export_name" ]
+        exportContentS
+
+    , do
+        singlePAny [ "module_export" ]
+        _ <- optional $ S.single "module"
+        ModuleNameEV <$> moduleNameS
+    ]
+
+
+exportContentS :: ScannerP ExposedSymbol
+exportContentS =
+  asum [
+      moduleExportContentS
+    , exposedNameContentS
+    ]
+
+
+moduleExportContentS :: ScannerP ExposedSymbol
+moduleExportContentS = do
+  S.single "module"
+  ModuleNameEV <$> moduleNameS
+
+
+importListS :: ScannerP (V.Vector Import, V.Vector Declaration)
 importListS = do
   debugOpt "im-imports" $ S.singleP "imports"
-  V.fromList <$> some importS
+  items <- many importItemS
+  pure $ foldl' collectImportItem (V.empty, V.empty) items
 
 
-{-
-  Import:
-    moduleName :: [Identifier]
-    , qualified :: Bool
-    , alias :: Maybe Identifier
-    , exposing :: V.Vector ExposedSymbol
--}
+importItemS :: ScannerP ImportItem
+importItemS =
+  asum [
+      ImportII <$> importS
+    , ImportUnknownII <$> commentS
+    , ImportUnknownII <$> unknownDeclS
+    ]
+
+
+collectImportItem :: (V.Vector Import, V.Vector Declaration) -> ImportItem
+    -> (V.Vector Import, V.Vector Declaration)
+collectImportItem state importItem =
+  case (state, importItem) of
+    ((imports, unknowns), ImportII importDef) -> (V.snoc imports importDef, unknowns)
+    ((imports, unknowns), ImportUnknownII declaration) -> (imports, V.snoc unknowns declaration)
+
+
 importS :: ScannerP Import
 importS = do
   debugOpt "im-import" $ S.singleP "import"
   S.single "import"
-  mbQualified <- optional $ S.single "qualified"
+  mbSource <- optional $ debugOpt "im-source" sourceImportS
+  mbSafe <- optional $ debugOpt "im-safe" $ S.single "safe"
+  mbPreQualified <- optional $ debugOpt "im-preQualified" $ S.single "qualified"
+  packageQualifier <- optional $ debugOpt "im-package" packageQualifierS
   moduleName <- debugOpt "im-moduleId" moduleNameS
+  mbPostQualified <- optional $ debugOpt "im-postQualified" $ S.single "qualified"
   alias <- optional $ debugOpt "im-alias" $ S.single "as" *> moduleNameS
-  exposing <- optional $ debugOpt "im-exposing" $ do
-    S.singleP "import_list"
-    S.single "("
-    symbols <- importNameS `S.sepBy` S.single ","
-    S.single ")"
-    pure $ V.fromList symbols
-  pure $ Import {
+  mbImportSpec <- optional $ debugOpt "im-selection" importSelectionS
+  trailingUnknowns <- many importTrailingUnknownS
+
+  let
+    qualification = importQualification (isJust mbPreQualified) (isJust mbPostQualified)
+    (selection, selectionUnknowns) = fromMaybe (AllIS, []) mbImportSpec
+
+  pure Import {
       moduleName = moduleName
-      , qualified = isJust mbQualified
-      , alias = alias
-      , exposing = fromMaybe V.empty exposing
+    , packageQualifier = packageQualifier
+    , qualification = qualification
+    , alias = alias
+    , importSpec = selection
+    , safeImport = isJust mbSafe
+    , sourceImport = isJust mbSource
+    , unknownImportDecls =
+        selectionUnknowns <> trailingUnknowns
     }
+
+
+importQualification :: Bool -> Bool -> ImportQualification
+importQualification preQualified postQualified =
+  case (preQualified, postQualified) of
+    (False, False) -> UnqualifiedIQ
+    (True, False) -> PreQualifiedIQ
+    (False, True) -> PostQualifiedIQ
+    (True, True) -> PreAndPostQualifiedIQ
+
+
+sourceImportS :: ScannerP ()
+sourceImportS =
+  void $ asum [
+      S.single "source"
+    , S.single "SOURCE"
+    , S.single "pragma"
+    ]
+
+
+packageQualifierS :: ScannerP Int
+packageQualifierS =
+  asum [
+      S.symbol "string"
+    , do
+        singlePAny [ "import_package", "package", "package_qualifier" ]
+        -- TODO: update TreeSitter.Haskell to be able to handle this syntax.
+        S.symbol "string"
+    ]
+
+
+importTrailingUnknownS :: ScannerP Declaration
+importTrailingUnknownS =
+  asum [
+      commentS
+    , unhandledAs "haddock"
+    , unhandledAs "ERROR"
+    ]
+
+
+importSelectionS :: ScannerP ( ImportSpec, [Declaration] )
+importSelectionS =
+  asum [
+      hidingBeforeListS
+    , importListSelectionS
+    ]
+
+
+hidingBeforeListS :: ScannerP ( ImportSpec, [Declaration] )
+hidingBeforeListS = do
+  S.single "hiding"
+  singlePAny [
+      "import_list"
+    , "import_spec"
+    ]
+  importSelectionBodyS HidingIS
+
+
+importListSelectionS :: ScannerP ( ImportSpec, [Declaration] )
+importListSelectionS = debugOpt "is-importListSelection" $ do
+  singlePAny [ "import_list", "import_spec" ]
+  mbHiding <- optional $ S.single "hiding"
+  let
+    constructor = if isJust mbHiding then HidingIS else OnlyIS
+  importSelectionBodyS constructor
+
+
+importSelectionBodyS :: (V.Vector ExposedSymbol -> ImportSpec) -> ScannerP ( ImportSpec, [Declaration] )
+importSelectionBodyS constructor = do
+  S.single "("
+  items <- optional $ exposedItemS importNameS `S.sepBy` S.single ","
+  S.single ")"
+  let
+    (symbols, unknowns) = maybe (V.empty, []) collectExposedItems items
+  pure (constructor symbols, unknowns)
 
 
 importNameS :: ScannerP ExposedSymbol
 importNameS = do
-  debugOpt "in-importName" $ S.singleP "import_name"
-  mainName <- asum [
-      TypeName <$> S.symbol "name"
-      , VarName <$> S.symbol "variable"
+  debugOpt "in-importName" $ singlePAny [ "import_name", "import_item" ]
+  exposedNameContentS
+
+
+exposedNameContentS :: ScannerP ExposedSymbol
+exposedNameContentS = do
+  mbNamespace <- optional namespaceS
+  mainName <- exposedMainS
+  children <- optional exposedChildrenS
+
+  let
+    completeName = case children of
+      Nothing -> mainName
+      Just childNames -> ComplexDef mainName childNames
+
+  pure $ case mbNamespace of
+    Nothing -> completeName
+    Just namespace -> NamespacedEV namespace completeName
+
+
+namespaceS :: ScannerP SymbolNamespace
+namespaceS =
+  namespaceTokenS <|> do
+    singlePAny [ "namespace", "explicit_namespace" ]
+    namespaceTokenS
+
+
+namespaceTokenS :: ScannerP SymbolNamespace
+namespaceTokenS =
+  asum [
+      S.single "type" $> TypeNS
+    , S.single "pattern" $> PatternNS
     ]
-  children <- optional $ do
-    debugOpt "in-children" $ S.singleP "children"
-    debugOpt "in-open" $ S.single "("
-    someChildren <- asum [
-       debugOpt "inc-allNames" $ S.single "all_names" $> V.singleton DoubleDotEV
-      , V.fromList <$> debugOpt "inc-names" (importedSymbolS `S.sepBy` S.single ",")
-      ]
-    debugOpt "in-close" $ S.single ")"
-    pure someChildren
-  case children of
-    Nothing -> pure mainName
-    Just someChildren -> pure $ ComplexDef mainName someChildren
 
 
-importedSymbolS :: ScannerP ExposedSymbol
-importedSymbolS = asum [
-    TypeName <$> S.symbol "name"
+exposedMainS :: ScannerP ExposedSymbol
+exposedMainS =
+  asum [
+      prefixExposedSymbolS
+    , TypeName <$> S.symbol "name"
     , VarName <$> S.symbol "variable"
     , ConstructorName <$> S.symbol "constructor"
-  ]
+    , OperatorName <$> S.symbol "operator"
+    , ConstructorOperatorName
+        <$> S.symbol "constructor_operator"
+    ]
 
+
+prefixExposedSymbolS :: ScannerP ExposedSymbol
+prefixExposedSymbolS = do
+  singlePAny [ "prefix_id", "prefix_operator" ]
+  S.single "("
+  symbol <- asum [
+      OperatorName <$> S.symbol "operator"
+    , ConstructorOperatorName
+        <$> S.symbol "constructor_operator"
+    , VarName <$> S.symbol "variable"
+    , ConstructorName <$> S.symbol "constructor"
+    ]
+  S.single ")"
+  pure symbol
+
+
+exposedChildrenS :: ScannerP (V.Vector ExposedSymbol)
+exposedChildrenS = do
+  debugOpt "in-children" $ S.singleP "children"
+  S.single "("
+  symbols <- asum [
+      S.single "all_names" $> V.singleton DoubleDotEV
+    , V.fromList <$> exposedChildS `S.sepBy` S.single ","
+    ]
+  S.single ")"
+  pure symbols
+
+
+exposedChildS :: ScannerP ExposedSymbol
+exposedChildS = do
+  mbNamespace <- optional namespaceS
+  symbol <- exposedMainS
+  pure $ case mbNamespace of
+    Nothing -> symbol
+    Just namespace -> NamespacedEV namespace symbol
+
+
+exposedItemS :: ScannerP ExposedSymbol -> ScannerP ExposedItem
+exposedItemS itemS =
+  asum [
+      KnownEI <$> itemS
+    , UnknownEI <$> commentS
+    , UnknownEI <$> unknownDeclS
+    ]
+
+
+collectExposedItems :: [ExposedItem] -> (V.Vector ExposedSymbol, [Declaration])
+collectExposedItems = foldl' collectExposedItem (V.empty, [])
+
+
+collectExposedItem :: (V.Vector ExposedSymbol, [Declaration]) -> ExposedItem -> (V.Vector ExposedSymbol, [Declaration])
+collectExposedItem state item =
+  case (state, item) of
+    ((symbols, unknowns), KnownEI symbol) -> (V.snoc symbols symbol, unknowns)
+    ((symbols, unknowns), UnknownEI declaration) -> (symbols, unknowns <> [declaration])
+
+
+singlePAny :: [String] -> ScannerP ()
+singlePAny nodeNames = void $ asum (map S.singleP nodeNames)
+
+-- ************* DECLARATIONS *************
 
 declarationsS :: ScannerP (V.Vector Declaration)
 declarationsS = do
   debugOpt "ds-declarations" $ S.singleP "declarations"
-  decl <- many $ asum [
-      signatureS
-    , FunctionDC <$> functionDeclS
-    , PostImportDC <$> importS
-    , commentS
-    {-
-    , BindingDC
-    , TopSpliceDC
-    , DataDC
-    , TypeSynonymDC
-    , NewtypeDC
-    , ClassDC
-    , InstanceDC
-    , DefaultDC
-    , ForeignDC
-    -}
-    ]
-  pure $ V.fromList decl
+  V.fromList <$> many declarationS
+
+
+declarationS :: ScannerP Declaration
+declarationS = asum [
+    debugOpt "dcl-kindSign" kindSignatureDeclS
+    , debugOpt "dcl-signature" signatureS
+    , debugOpt "dcl-dataDecl" $ DataDC <$> dataDeclS
+    , debugOpt "dcl-newtypeDecl" $ NewtypeDC <$> newtypeDeclS
+    , debugOpt "dcl-typeSynonymDecl" $ TypeSynonymDC <$> typeSynonymDeclS
+    , debugOpt "dcl-classDecl" $ ClassDC <$> classDeclS
+    , debugOpt "dcl-familyDecl" $ FamilyDC <$> familyDeclS
+    , debugOpt "dcl-functionDecl" $ FunctionDC <$> functionDeclS
+    , debugOpt "dcl-patternBinding" $ BindingDC <$> patternBindingS
+    , debugOpt "dcl-topSplice" $ TopSpliceDC <$> topSpliceS
+    , debugOpt "dcl-postImport" $ PostImportDC <$> importS
+    , debugOpt "dcl-comment" commentS
+    , debugOpt "dcl-unknownDecl" unknownDeclS
+  ]
 
 
 signatureS :: ScannerP Declaration
 signatureS = debugOpt "sg-signature" $ do
   S.singleP "signature"
-  variable <- S.symbol "variable"
+  firstName <- signatureNameS
+  additionalNames <- many $ S.single "," *> signatureNameS
   S.single "::"
-  -- TODO: deal with TypeConstraints
-  SignatureDC variable <$> typeSignatureS
+  SignatureDC (V.fromList $ firstName : additionalNames) <$> typeSignatureS
 
 
-typeSignatureS :: ScannerP TypeAnnotation
-typeSignatureS = asum [
-    nameSignatureS
-    , functionSignatureS
-    , applySignatureS
-    , parenSignatureS
-    , unitSignatureS
+kindSignatureDeclS :: ScannerP Declaration
+kindSignatureDeclS = debugOpt "kg-kindSignature" $ do
+  singlePAny [ "kind_signature", "standalone_kind_signature" ]
+  _ <- optional $ S.single "type"
+  signatureName <- signatureNameS
+  S.single "::"
+  KindSignatureDC signatureName <$> typeSignatureS
+
+
+signatureNameS :: ScannerP SignatureName
+signatureNameS = asum [
+    prefixSignatureNameS
+    , VariableSN <$> S.symbol "variable"
+    , TypeSN <$> S.symbol "name"
+    , ConstructorSN <$> S.symbol "constructor"
+    , OperatorSN <$> S.symbol "operator"
+    , ConstructorOperatorSN <$> S.symbol "constructor_operator"
   ]
 
-nameSignatureS :: ScannerP TypeAnnotation
-nameSignatureS = do
-  NameTA <$> debugOpt "ns-nameSignature" identifierS
 
-
-unitSignatureS :: ScannerP TypeAnnotation
-unitSignatureS = do
-  debugOpt "us-unitSignature" $ S.singleP "unit"
+prefixSignatureNameS :: ScannerP SignatureName
+prefixSignatureNameS = do
+  singlePAny [ "prefix_id", "prefix_operator" ]
   S.single "("
+  signatureName <- asum [
+      OperatorSN <$> S.symbol "operator"
+    , ConstructorOperatorSN <$> S.symbol "constructor_operator"
+    , VariableSN <$> S.symbol "variable"
+    , ConstructorSN <$> S.symbol "constructor"
+    ]
   S.single ")"
-  pure VoidTA
+  pure signatureName
 
 
-functionSignatureS :: ScannerP TypeAnnotation
-functionSignatureS = do
-  debugOpt "fs-functionSignature" $ S.singleP "function"
-  leftSide <- typeSignatureS
-  S.single "->"
-  FunctionTA leftSide <$> typeSignatureS
+dataDeclS :: ScannerP DataDeclaration
+dataDeclS = debugOpt "dataDecl-top" $ do
+  debugOpt "dd-dataType" $ S.singleP "data_type"
+  S.single "data"
+  typeHead <- typeHeadS
+  debugOpt ("dd-typeHead: " <> show typeHead) $ pure ()
+  _ <- optional $ S.single "="
+  (constructors, constructorUnknowns) <- fromMaybe ([], []) <$> optional dataConstructorsS
+  debugOpt ("dd-ctorUnk: " <> show constructorUnknowns) $ pure ()
+  (derivings, tailUnknowns) <- collectDeclarationTail <$> many declarationTailItemS
+  debugOpt ("dd-tailUnk: " <> show tailUnknowns) $ pure ()
+  pure $ DataDeclaration typeHead constructors derivings (constructorUnknowns <> tailUnknowns)
 
 
-applySignatureS :: ScannerP TypeAnnotation
-applySignatureS = do
-  debugOpt "as-applySignature" $ S.singleP "apply"
-  leftSide <- typeSignatureS
-  ApplyTA leftSide <$> typeSignatureS
+dataConstructorsS :: ScannerP ([DataConstructor], [Declaration])
+dataConstructorsS = debugOpt "dc-dataCtor-try" $ do
+  debugOpt "dc-dataCtorN" $ S.singleP "data_constructors"
+  collectConstructorItems <$> many constructorItemS
 
 
-parenSignatureS :: ScannerP TypeAnnotation
-parenSignatureS = do
-  debugOpt "ps-parenSignature" $ S.singleP "parens"
-  S.single "("
-  innerSignature <- typeSignatureS
-  S.single ")"
-  pure $ ParenTA innerSignature
+constructorItemS :: ScannerP ConstructorItem
+constructorItemS = asum [
+    ConstructorCI <$> dataConstructorS
+    , ConstructorSeparatorCI <$ S.single "|"
+    , ConstructorUnknownCI <$> commentS
+    -- , ConstructorUnknownCI <$> unknownDeclS
+  ]
 
 
-{-
-top level binding:
-test = True
-| bind (6,0)-(6,11)
-  | variable (6,0)-(6,4)
-  | match (6,5)-(6,11)
-    | = (6,5)-(6,6)
-    | constructor (6,7)-(6,11)
-
-top level expression ~ 1 + 2:
-| top_splice (11,0)-(11,5)
-  | infix (11,0)-(11,5)
-    | literal (11,0)-(11,1)
-      | integer (11,0)-(11,1)
-    | operator (11,2)-(11,3)
-    | literal (11,4)-(11,5)
-      | integer (11,4)-(11,5)
+collectConstructorItems :: [ConstructorItem] -> ([DataConstructor], [Declaration])
+collectConstructorItems = foldl' collectConstructorItem ([], [])
 
 
-instanceS:
-instance Show AThing where
-  show x = show x.allo
-
-| instance (5,0)-(6,22)
-  | instance (5,0)-(5,8)
-  | name (5,9)-(5,13)
-  | type_patterns (5,14)-(5,20)
-    | name (5,14)-(5,20)
-  | where (5,21)-(5,26)
-  | instance_declarations (6,2)-(6,22)
-    | function (6,2)-(6,22)
-      | variable (6,2)-(6,6)
-      | patterns (6,7)-(6,8)
-        | variable (6,7)-(6,8)
-      | match (6,9)-(6,22)
-        | = (6,9)-(6,10)
-        | apply (6,11)-(6,22)
-          | variable (6,11)-(6,15)
-          | projection (6,16)-(6,22)
-            | variable (6,16)-(6,17)
-            | . (6,17)-(6,18)
-            | field_name (6,18)-(6,22)
-              | variable (6,18)-(6,22)
-
-x.y.allo:
-  | projection (6,7)-(6,15)
-    | projection (6,7)-(6,10)
-      | variable (6,7)-(6,8)
-      | . (6,8)-(6,9)
-      | field_name (6,9)-(6,10)
-        | variable (6,9)-(6,10)
-    | . (6,10)-(6,11)
-    | field_name (6,11)-(6,15)
-      | variable (6,11)-(6,15)
+collectConstructorItem :: ([DataConstructor], [Declaration]) -> ConstructorItem
+    -> ([DataConstructor], [Declaration])
+collectConstructorItem state item =
+  case (state, item) of
+    ((constructors, unknowns), ConstructorCI constructor) -> (constructors <> [constructor], unknowns)
+    ((constructors, unknowns), ConstructorUnknownCI unknown) -> (constructors, unknowns <> [unknown])
+    (stateValue, ConstructorSeparatorCI) -> stateValue
 
 
-data def + record:
-| data_type (5,0)-(8,3)
-  | data (5,0)-(5,4)
-  | name (5,5)-(5,7)
-  | = (5,8)-(5,9)
-  | data_constructors (5,10)-(8,3)
-    | data_constructor (5,10)-(8,3)
-      | record (5,10)-(8,3)
-        | constructor (5,10)-(5,12)
-        | fields (5,13)-(8,3)
-          | { (5,13)-(5,14)
-          | field (6,4)-(6,16)
-            | field_name (6,4)-(6,6)
-              | variable (6,4)-(6,6)
-            | :: (6,7)-(6,9)
-            | name (6,10)-(6,16)
-          | , (7,4)-(7,5)
-          | field (7,6)-(7,16)
-            | field_name (7,6)-(7,8)
-              | variable (7,6)-(7,8)
-            | :: (7,9)-(7,11)
-            | name (7,12)-(7,16)
-          | } (8,2)-(8,3)
+dataConstructorS :: ScannerP DataConstructor
+dataConstructorS = debugOpt "dc-knownDC" $ knownDataConstructorS <|> debugOpt "dc-unknownDC" unknownDataConstructorS
 
 
-
-x = 1 :: Int:
-| bind (7,4)-(7,16)
-  | variable (7,4)-(7,5)
-  | match (7,6)-(7,16)
-    | = (7,6)-(7,7)
-    | signature (7,8)-(7,16)
-      | literal (7,8)-(7,9)
-        | integer (7,8)-(7,9)
-      | :: (7,10)-(7,12)
-      | name (7,13)-(7,16)
-
-
-function def:
-| function (5,0)-(9,7)
-  | variable (5,0)-(5,4)
-  | patterns (5,5)-(5,6)
-    | variable (5,5)-(5,6)
-  | match
-      =
-      do
-        do
-        bind
-          variable
-          <-
-          variable | apply
-
-fct def with type deconstruction ~ f (T v) = x
-| function (5,0)-(5,15)
-  | variable (5,0)-(5,4)
-  | patterns (5,5)-(5,11)
-    | parens (5,5)-(5,11)
-      | ( (5,5)-(5,6)
-      | apply (5,6)-(5,10)
-        | constructor (5,6)-(5,8)
-        | variable (5,9)-(5,10)
-      | ) (5,10)-(5,11)
-  | match (5,12)-(5,15)
-    | = (5,12)-(5,13)
-
-fct def with guards (otherwise is thread as 'variable'):
-| function (5,0)-(9,13)
-  | variable (5,0)-(5,4)
-  | patterns (5,5)-(5,8)
-    | variable (5,5)-(5,6)
-    | variable (5,7)-(5,8)
-  | match (6,2)-(6,13)
-    | | (6,2)-(6,3)
-    | guards (6,4)-(6,9)
-      | boolean (6,4)-(6,9)
-        | infix (6,4)-(6,9)
-          | variable (6,4)-(6,5)
-          | operator (6,6)-(6,7)
-          | variable (6,8)-(6,9)
-    | = (6,10)-(6,11)
-    | literal (6,12)-(6,13)
-      | integer (6,12)-(6,13)
-  -- otherwise:
-  | match (8,2)-(8,17)
-    | | (8,2)-(8,3)
-    | guards (8,4)-(8,13)
-      | boolean (8,4)-(8,13)
-        | variable (8,4)-(8,13)  <= otherwise!!
-    | = (8,14)-(8,15)
-    | literal (8,16)-(8,17)
-      | integer (8,16)-(8,17)
-
-fct def with 'where' part:
-| function (5,0)-(8,13)
-  | variable (5,0)-(5,4)
-  | patterns (5,5)-(5,8)
-    | variable (5,5)-(5,6)
-    | variable (5,7)-(5,8)
-  | match (6,2)-(7,11)
-  ...
-  | where (8,2)-(8,7)
-  | local_binds (8,7)-(8,13)
-    | bind (8,8)-(8,13)
-      | variable (8,8)-(8,9)
-      | match (8,10)-(8,13)
-        | = (8,10)-(8,11)
-        | variable (8,12)-(8,13)
-  
-
-Pattern match on assignment ~ let (T v) = x
-  | parens (7,4)-(7,9)
-    | ( (7,4)-(7,5)
-    | apply (7,5)-(7,8)
-      | constructor (7,5)-(7,6)
-      | variable (7,7)-(7,8)
-    | ) (7,8)-(7,9)
-  | match (7,10)-(7,20)
-    | = (7,10)-(7,11)
-    | ...
+knownDataConstructorS :: ScannerP DataConstructor
+knownDataConstructorS = debugOpt "dc-knownDC-try" $ do
+  debugOpt "dc-dataCtor1" $ S.singleP "data_constructor"
+  constructor <- asum [
+    debugOpt "dc-classicCns" $ ClassicCns <$> classicConstructorS
+    , debugOpt "dc-recordCns" $ RecordCns <$> recordConstructorS
+    , debugOpt "dc-sumCns" $ SumCns <$> sumTypeConstructorS
+    ]
+  _ <- optional commentS
+  pure constructor
 
 
-list construction ~ 1 : [2,3]:
-  | infix (7,8)-(7,17)
-    | literal (7,8)-(7,9)
-      | integer (7,8)-(7,9)
-    | constructor_operator (7,10)-(7,11)
-    | list (7,12)-(7,17)
-      | [ (7,12)-(7,13)
-      | literal (7,13)-(7,14)
-        | integer (7,13)-(7,14)
-      | , (7,14)-(7,15)
-      | literal (7,15)-(7,16)
-        | integer (7,15)-(7,16)
-      | ] (7,16)-(7,17)
+unknownDataConstructorS :: ScannerP DataConstructor
+unknownDataConstructorS = debugOpt "dc-unknownDC" $ do
+  ne <- S.single "data_constructor"
+  pure $ UnknownCns ne.name (spanNE ne)
 
 
-transforming postfix into infix ~ x `f` y:
-| infix (7,4)-(7,15)
-  | variable (7,4)-(7,5)
-  | infix_id (7,6)-(7,13)
-    | ` (7,6)-(7,7)
-    | variable (7,7)-(7,12)
-    | ` (7,12)-(7,13)
-  | literal (7,14)-(7,15)
-    | integer (7,14)-(7,15)
-
-prefixing infix ~ (+) 1 2:
-| apply (6,11)-(6,18)
-  | apply (6,11)-(6,16)
-    | prefix_id (6,11)-(6,14)
-      | ( (6,11)-(6,12)
-      | operator (6,12)-(6,13)
-      | ) (6,13)-(6,14)
-    | literal (6,15)-(6,16)
-      | integer (6,15)-(6,16)
-  | literal (6,17)-(6,18)
-    | integer (6,17)-(6,18)
+classicConstructorS :: ScannerP (Identifier, [TypeAnnotation])
+classicConstructorS = do
+  debugOpt "cc-prefix" $ S.singleP "prefix"
+  constructorName <- NameIdent <$> S.symbol "constructor"
+  types <- many typeSignatureS
+  pure (constructorName, types)
 
 
-Quasiquote ~ [TH.vectorStatement| ... |]
-| quasiquote (7,8)-(9,4)
-  | [ (7,9)-(7,10)
-  | quoter (7,10)-(7,28)
-    | qualified (7,10)-(7,28)
-      | module (7,10)-(7,13)
-        | module_id (7,10)-(7,12)
-        | . (7,12)-(7,13)
-      | variable (7,13)-(7,28)
-  | | (7,28)-(7,29)
-  | quasiquote_body (7,29)-(9,2)
-  | |] (9,2)-(9,4)
-
--}
-functionDeclS :: ScannerP FunctionContent
-functionDeclS = debug "fn-function" $ do
-  S.singleP "function"
-  fName <- S.symbol "variable"
-  patterns <- debugOpt "fn-patterns" patternsS
-  body <- debug "fn-match" (many matchS)
-  pure $ FunctionContent fName patterns body
-
-patternsS :: ScannerP (V.Vector Int)
-patternsS = do
-  debugOpt "ps-patterns" $ S.singleP "patterns"
-  -- TODO: match all kind of patterns, return a Pattern instance:
-  V.fromList <$> many (S.symbol "variable")
+newtypeRecordConstructorS :: ScannerP (Identifier, [DataConstructorField])
+newtypeRecordConstructorS = do
+  constructorName <- debugOpt "rc-constructor" $ NameIdent <$> S.symbol "constructor"
+  S.singleP "record"
+  debugOpt "rc-field1-inner" $ S.single "{"
+  field <- dataConstructorFieldS
+  S.single "}"      
+  pure (constructorName, [field])
 
 
-matchS :: ScannerP MatchContent
-matchS = debug "ms-match" $ do
-  debugOpt "ms-symbol" $ S.singleP "match"
-  guards <- debugOpt "ms-guards" $ many fctGuardS
+recordConstructorS :: ScannerP (Identifier, [DataConstructorField])
+recordConstructorS = do
+  S.singleP "record"
+  constructorName <- debugOpt "rc-constructor" $ NameIdent <$> S.symbol "constructor"
+  S.singleP "fields"
+  debugOpt "rc-fieldN-inner" $ S.single "{"
+  fields <- dataConstructorFieldS `S.sepBy` S.single ","
+  S.single "}"
+  pure (constructorName, fields)
+
+
+dataConstructorFieldS :: ScannerP DataConstructorField
+dataConstructorFieldS = do
+  S.singleP "field"
+  S.singleP "field_name"
+  fieldName <- debugOpt "dcf-fieldName" $ VarIdent <$> S.symbol "variable"
+  S.single "::"
+  DataConstructorField fieldName <$> typeSignatureS
+
+
+sumTypeConstructorS :: ScannerP SumDecl
+sumTypeConstructorS = do
+  debugOpt "st-prefix" $ S.singleP "prefix"
+  constructorName <- NameIdent <$> S.symbol "constructor"
+  SumDecl constructorName <$> many typeSignatureS
+
+
+newtypeDeclS :: ScannerP NewtypeDeclaration
+newtypeDeclS = do
+  debugOpt "nt-newtypeDecl" $ singlePAny [ "newtype", "newtype_type" ]
+  S.single "newtype"
+  typeHead <- typeHeadS
   S.single "="
-  MatchContent guards <$> debugOpt "ms-expression" expressionS
+  constructor <- newtypeConstructorS
+  (derivings, unknowns) <- collectDeclarationTail <$> many declarationTailItemS
+  pure $ NewtypeDeclaration typeHead constructor derivings unknowns
 
 
-fctGuardS :: ScannerP GuardContent
-fctGuardS = do
-  debugOpt "fm-fctGuard" $ S.single "|"
-  debugOpt "fctGrd-expr" guardedExpressionS
-
-
-guardedExpressionS :: ScannerP GuardContent
-guardedExpressionS = debug "ge-guardedExpression" $ do
-  debugOpt "ge-guardedExpression" $ S.singleP "guards"
+newtypeConstructorS :: ScannerP DataConstructor
+newtypeConstructorS = do
+  S.singleP "newtype_constructor"
   asum [
-      booleanGuardS
-      , BindingGuardGC <$> bindPatternContentS `S.sepBy` S.single ","
+      debugOpt "nt-recordCtor" $ RecordCns <$> newtypeRecordConstructorS
+    , debugOpt "nt-sumCtor" $ SumCns <$> sumTypeConstructorS
+    , debugOpt "nt-directCtor" $ directNewtypeConstructorS
     ]
 
-booleanGuardS :: ScannerP GuardContent
-booleanGuardS = do
-  debugOpt "ge-booleanGuard" $ S.singleP "boolean"
-  BooleanGuardGC <$> expressionS
+
+directNewtypeConstructorS :: ScannerP DataConstructor
+directNewtypeConstructorS = do
+  constructorName <- NameIdent <$> S.symbol "constructor"
+  fields <- many $ newtypeFieldS <|> typeSignatureS
+  pure $ SumCns $ SumDecl constructorName fields
 
 
-bindPatternContentS :: ScannerP BindContent
-bindPatternContentS = do
-  S.singleP "pattern_guard"
-  bindContentS
+newtypeFieldS :: ScannerP TypeAnnotation
+newtypeFieldS = do
+  S.singleP "field"
+  typeSignatureS
+
+
+typeSynonymDeclS :: ScannerP TypeSynonymDeclaration
+typeSynonymDeclS = do
+  debugOpt "sy-typeSynonym" $ S.singleP "type_synomym"
+  S.single "type"
+  typeHead <- directTypeHeadS
+  S.single "="
+  TypeSynonymDeclaration typeHead <$> typeSignatureS
+
+
+derivingS :: ScannerP DerivingDecl
+derivingS = do
+  debugOpt "dr-deriving" $ S.singleP "deriving"
+  S.single "deriving"
+  strategy <- optional derivingStrategyS
+  viaType <- optional derivingViaS
+  classes <- derivingClassesS
+  pure $ DerivingDecl strategy classes viaType
+
+
+derivingStrategyS :: ScannerP DerivingStrategy
+derivingStrategyS =
+  derivingStrategyTokenS <|> do
+    singlePAny [ "strategy", "deriving_strategy" ]
+    derivingStrategyTokenS
+
+
+derivingStrategyTokenS :: ScannerP DerivingStrategy
+derivingStrategyTokenS = asum [
+    S.single "stock" $> StockDS
+    , S.single "newtype" $> NewtypeDS
+    , S.single "anyclass" $> AnyclassDS
+  ]
+
+
+derivingViaS :: ScannerP TypeAnnotation
+derivingViaS =
+  (S.single "via" *> typeSignatureS) <|> do
+    S.singleP "via"
+    _ <- optional $ S.single "via"
+    typeSignatureS
+
+
+derivingClassesS :: ScannerP [TypeAnnotation]
+derivingClassesS =
+  do
+    S.singleP "tuple"
+    S.single "("
+    classes <- typeSignatureS `S.sepBy` S.single ","
+    S.single ")"
+    pure classes
+  <|> ((:[]) <$> typeSignatureS)
+
+
+declarationTailItemS :: ScannerP DeclarationTailItem
+declarationTailItemS = asum [
+    DerivingTI <$> debugOpt "dti-deriving" derivingS
+    -- , TailUnknownTI <$> debugOpt "dti-tailUnknown" unknownDeclS
+  ]
+
+
+collectDeclarationTail :: [DeclarationTailItem] -> ([DerivingDecl], [Declaration])
+collectDeclarationTail = foldl' collectDeclarationTailItem ([], [])
+
+
+collectDeclarationTailItem :: ([DerivingDecl], [Declaration]) -> DeclarationTailItem
+    -> ([DerivingDecl], [Declaration])
+collectDeclarationTailItem state item =
+  case (state, item) of
+    ((derivings, unknowns), DerivingTI derivingDecl) -> (derivings <> [derivingDecl], unknowns)
+    ((derivings, unknowns), TailUnknownTI unknown) -> (derivings, unknowns <> [unknown])
+
+
+classDeclS :: ScannerP ClassDeclaration
+classDeclS = do
+  S.singleP "class"
+  debugOpt "cl-class" $ S.single "class"
+  typeHead <- typeHeadS
+  headUnknowns <- many classHeadUnknownS
+  _ <- optional $ S.single "where"
+  body <- fromMaybe V.empty <$> optional classDeclarationsS
+  pure $ ClassDeclaration typeHead body headUnknowns
+
+
+classHeadUnknownS :: ScannerP Declaration
+classHeadUnknownS = asum [
+    commentS
+    , unhandledAs "haddock"
+    , unhandledAs "functional_dependencies"
+    , unhandledAs "fundeps"
+    , unhandledAs "pragma"
+    , unhandledAs "ERROR"
+  ]
+
+
+classDeclarationsS :: ScannerP (V.Vector Declaration)
+classDeclarationsS = do
+  singlePAny [ "class_declarations", "class_body" ]
+  V.fromList <$> many classDeclarationS
+
+
+classDeclarationS :: ScannerP Declaration
+classDeclarationS = asum [
+    debugOpt "cd-kindS" kindSignatureDeclS
+    , debugOpt "cd-sign" signatureS
+    , debugOpt "cd-typeSyn" $ TypeSynonymDC <$> typeSynonymDeclS
+    , debugOpt "cd-family" $ FamilyDC <$> familyDeclS
+    , debugOpt "cd-function" $ FunctionDC <$> functionDeclS
+    , debugOpt "cd-binding" $ BindingDC <$> patternBindingS
+    , commentS
+  ]
+
+
+familyDeclS :: ScannerP FamilyDeclaration
+familyDeclS = typeFamilyDeclS <|> dataFamilyDeclS
+
+
+typeFamilyDeclS :: ScannerP FamilyDeclaration
+typeFamilyDeclS = familyDeclOf TypeFK "type_family" "type"
+
+
+dataFamilyDeclS :: ScannerP FamilyDeclaration
+dataFamilyDeclS = familyDeclOf DataFK "data_family" "data"
+
+
+familyDeclOf :: FamilyKind -> String -> String -> ScannerP FamilyDeclaration
+familyDeclOf familyKind nodeName keyword = do
+  S.singleP nodeName
+  debugOpt ("fm-" <> nodeName) $ S.single keyword
+  _ <- optional $ S.single "family"
+  typeHead <- typeHeadS
+  resultKind <- optional familyResultKindS
+  -- unknowns <- many unknownDeclS
+  let
+    completedHead = case resultKind of
+      Nothing -> typeHead
+      Just typeKind -> typeHead { kindTH = Just typeKind }
+  pure $ FamilyDeclaration familyKind completedHead []
+
+
+familyResultKindS :: ScannerP TypeAnnotation
+familyResultKindS = S.single "::" *> typeSignatureS
 
 
 commentS :: ScannerP Declaration
@@ -484,203 +781,6 @@ typeNameS = do
 varNameS :: ScannerP ExposedSymbol
 varNameS = do
   VarName <$> S.symbol "variable"
-
-
-expressionS :: ScannerP Expression
-expressionS =
-  debug "ex-expr" $ asum [
-    infixExS
-    , literalS
-    , variableS
-    , QualifiedEX <$> qualifiedNameS
-    , projectionS
-    , doS
-    , applyS
-    , letInS
-    , constructorS
-    , parenExprS
-    , caseExprS
-    , ifThenElseS
-    , listExprS
-    , tupleExprS
-    , unitExprS
-  ]
-
-doS :: ScannerP Expression
-doS = do
-  debugOpt "do-do" $ S.singleP "do"
-  S.single "do"
-  DoEX <$> some doStatementS
-
-
-doStatementS :: ScannerP DoStatementHskl
-doStatementS = debug "do-doStatement" $
-  asum [
-      doExprS
-    , letShortDoStmtS
-    , bindDoStmtS
-    , CommentST <$> S.symbol "comment"
-    ]
-
-
-bindDoStmtS :: ScannerP DoStatementHskl
-bindDoStmtS = do
-  debugOpt "do-bindDoStmt" $ S.singleP "bind"
-  BindST <$> bindContentS
-
-
-letShortDoStmtS :: ScannerP DoStatementHskl
-letShortDoStmtS = do
-  debugOpt "lsd-keyword" $ S.singleP "let"
-  LetShortST <$> letBindingsS
-
-
-doExprS :: ScannerP DoStatementHskl
-doExprS = do
-  debugOpt "do-doExpr" $ S.singleP "exp"
-  ExpressionST <$> expressionS
-
-
-bindContentS :: ScannerP BindContent
-bindContentS = do
-  leftSide <- debugOpt "be-leftSide" variableS
-  S.single "<-"
-  BindContent MonadicBO leftSide <$> expressionS
-
-
-caseExprS :: ScannerP Expression
-caseExprS = do
-  debugOpt "ce-entry" $ S.singleP "case"
-  S.single "case"
-  expr <- debugOpt "ce-expr" expressionS
-  S.single "of"
-  debugOpt "ce-alternatives" $ S.singleP "alternatives"
-  alternatives <- some alternativeS
-  pure $ CaseEX expr alternatives
-
-
-alternativeS :: ScannerP Alternative
-alternativeS = debug "ce-alternative" $ do
-  debugOpt "ca-keyword" $ S.singleP "alternative"
-  guard <- expressionS
-  S.singleP "match"
-  S.single "->"
-  Alternative guard <$> expressionS
-
-
-ifThenElseS :: ScannerP Expression
-ifThenElseS = do
-  debugOpt "ie-ifThenElse" $ S.singleP "conditional"
-  S.single "if"
-  condition <- expressionS
-  S.single "then"
-  thenExpr <- expressionS
-  S.single "else"
-  IfThenElseEX condition thenExpr <$> expressionS
-
-
-constructorS :: ScannerP Expression
-constructorS = debugOpt "co-constr" $ do
-  ConstructorEX <$> S.symbol "constructor"
-
-applyS :: ScannerP Expression
-applyS = do
-  debugOpt "ap-apply" $ S.singleP "apply"
-  leftSide <- expressionS
-  ApplyEX leftSide <$> expressionS
-
-
-letInS :: ScannerP Expression
-letInS = do
-  debugOpt "let-keyword" $ S.singleP "let_in"
-  bindings <- letBindingsS
-  S.single "in"
-  LetInEX bindings <$> expressionS
-
-
-letBindingsS :: ScannerP [LetBinding]
-letBindingsS = debug "lb-letBindings" $ do
-  debugOpt "lB-keyword" $ S.single "let"
-  debugOpt "lB-local_binds" $ S.singleP "local_binds"
-  some $ asum [
-    SimpleLB <$> bindLetExprS
-    , FunctionLB <$> functionDeclS
-    ]
-
-
-bindLetExprS :: ScannerP BindContent
-bindLetExprS = do
-  debugOpt "ble-keyword" $ S.singleP "bind"
-  leftSide <- variableS
-  S.singleP "match"
-  S.single "="
-  BindContent EquateBO leftSide <$> expressionS
-
-
-infixExS :: ScannerP Expression
-infixExS = do
-  debugOpt "ie-infixEx" $ S.singleP "infix"
-  leftSide <- expressionS
-  operator <- S.symbol "operator"
-  InfixEX leftSide operator <$> expressionS
-
-
-parenExprS :: ScannerP Expression
-parenExprS = do
-  debugOpt "pe-parenExpr" $ S.singleP "parens"
-  S.single "("
-  expr <- expressionS
-  S.single ")"
-  pure $ ParenEX expr
-
-
-listExprS :: ScannerP Expression
-listExprS = do
-  debugOpt "le-listExpr" $ S.singleP "list"
-  S.single "["
-  exprs <- expressionS `S.sepBy` S.single ","
-  S.single "]"
-  pure $ ListEX exprs
-
-
-tupleExprS :: ScannerP Expression
-tupleExprS = do
-  debugOpt "te-tupleExpr" $ S.singleP "tuple"
-  S.single "("
-  exprs <- expressionS `S.sepBy` S.single ","
-  S.single ")"
-  pure $ TupleEX exprs
-
-unitExprS :: ScannerP Expression
-unitExprS = do
-  debugOpt "ue-unitExpr" $ S.singleP "unit"
-  S.single "("
-  S.single ")"
-  pure VoidEX
-
-variableS :: ScannerP Expression
-variableS = do
-  debugOpt "ve-variable" $ VariableEX <$> S.symbol "variable"
-
-projectionS :: ScannerP Expression
-projectionS = debug "pr-projection" $ do
-  debugOpt "pr-keyword" $ S.singleP "projection"
-  prefix <- variableS
-  S.single "."
-  S.singleP "field_name"
-  ProjectionEX prefix <$> variableS
-
-
-literalS :: ScannerP Expression
-literalS = do
-  debugOpt "le-literal" $ S.singleP "literal"
-  -- TODO: consume literal (integer, float, string, char, boolean)
-  LiteralEX <$> asum [
-    IntegerLT <$> S.symbol "integer"
-    , FloatLT <$> S.symbol "float"
-    , StringLT <$> S.symbol "string"
-    , CharLT <$> S.symbol "char"
-    ]
 
 
 identifierS :: ScannerP Identifier
@@ -717,7 +817,7 @@ moduleIdS = do
 
 
 qualifiedNameS :: ScannerP Identifier
-qualifiedNameS = debug "qs-qualified" $ do
+qualifiedNameS = debugOpt "qs-qualified" $ do
   S.singleP "qualified"
   moduleName <- qualifiedModuleNameS
   QualIdent moduleName <$> shortIdentS
@@ -726,178 +826,3 @@ qualifiedNameS = debug "qs-qualified" $ do
 qualifiedModuleNameS :: ScannerP [Identifier]
 qualifiedModuleNameS = do
   moduleNameS <* S.single "."
-
-
-{-
-Signatures:
-signatureS parses such a declaration:
-| signature (32,0)-(32,65)
-  | variable (32,0)-(32,5)
-  | :: (32,6)-(32,8)
-  | function (32,9)-(32,65)
-    | name (32,9)-(32,13)
-    | -> (32,14)-(32,16)
-    | function (32,17)-(32,65)
-      | name (32,17)-(32,25)
-      | -> (32,26)-(32,28)
-      | apply (32,29)-(32,65)
-        | name (32,29)-(32,31)
-        | parens (32,32)-(32,65)
-          | ( (32,32)-(32,33)
-          | apply (32,33)-(32,64)
-            | apply (32,33)-(32,49)
-              | name (32,33)-(32,39)
-              | name (32,40)-(32,49)
-            | name (32,50)-(32,64)
-          | ) (32,64)-(32,65)
-
-signature with context:
-| signature (5,0)-(5,34)
-  | variable (5,0)-(5,4)
-  | :: (5,5)-(5,7)
-  | context (5,7)-(5,34)
-    | apply (5,8)-(5,16)
-      | name (5,8)-(5,14)
-      | variable (5,15)-(5,16)
-    | => (5,17)-(5,19)
-    | ...
-
-quantified context ~ forall a. (...) =>
-  | forall (5,8)-(5,51)
-    | forall (5,8)-(5,14)
-    | quantified_variables (5,15)-(5,16)
-      | variable (5,15)-(5,16)
-    | . (5,16)-(5,17)
-    | context (5,17)-(5,51)
-      | ...
--}
-
-{-
-Declarations:
-let/in:
-| let_in (6,2)-(9,7)
-  | let (6,2)-(6,5)
-  | local_binds (7,4)-(7,9)
-    | bind (7,4)-(7,9)
-      | variable (7,4)-(7,5)
-      | match (7,6)-(7,9)
-        | = (7,6)-(7,7)
-        | literal (7,8)-(7,9)
-          | integer (7,8)-(7,9)
-  | in (8,2)-(8,4)
-  | infix (9,2)-(9,7)
-    | variable (9,2)-(9,3)
-    | operator (9,4)-(9,5)
-    | variable (9,6)-(9,7)
-
-
-Short let (do):
-| let (55,2)-(56,38)
-  | let (55,2)-(55,5)
-  | local_binds (56,4)-(56,38)
-    | bind (56,4)-(56,38)
-      | variable (56,4)-(56,11)
-      | match (56,12)-(56,38)
-        | = (56,12)-(56,13)
-        | apply (56,14)-(56,38)
-          | variable (56,14)-(56,28)
-          | variable (56,29)-(56,38)
-      | bind (57,2)-(57,23)
-
-
-expression:
-  exp
-    <variable>
-    | <literal>
-    | <infix>
-    | <apply>
-    | <constructor>
-    | <parens>
-    | <case>
-
-infix:
-  infix
-    <expression>
-    operator
-    <expression>
-
-
-case:
-  case
-    case
-    <expression>
-    of
-    alternatives
-      alternative
-        <expression>
-        match
-          ->
-          <statement>
-      alternative
-        <expression>
-        match
-          ->
-          <statement>
-
-
-list:
-  list
-    [
-    ...
-    ]
-
-
-tuple:
-  tuple
-    (
-    expression
-    ,
-    ...
-    )
-
-
-statement:
-  <do>
-  | <bind>
-  | <comment>
-  | <let>
-  | <expression>
-
-
-literal:
-  literal
-    string | integer | float | char
-
-
-fct def with assignment guards ~
-  test x y
-    | Just v1 <- f1 x1, Just v2 <- f2 x2
-    = f3 x y:
-| function (5,0)-(8,13)
-  | variable (5,0)-(5,4)
-  | patterns (5,5)-(5,8)
-    | variable (5,5)-(5,6)
-    | variable (5,7)-(5,8)
-  | match (6,2)-(7,11)
-    | | (6,2)-(6,3)
-    | guards (6,4)-(6,38)
-      | pattern_guard (6,4)-(6,20)
-        | apply (6,4)-(6,11)
-          | constructor (6,4)-(6,8)
-          | variable (6,9)-(6,11)
-        | <- (6,12)-(6,14)
-        | apply (6,15)-(6,20)
-          | variable (6,15)-(6,17)
-          | variable (6,18)-(6,20)
-      | , (6,20)-(6,21)
-      | pattern_guard (6,22)-(6,38)
-        | apply (6,22)-(6,29)
-          | constructor (6,22)-(6,26)
-          | variable (6,27)-(6,29)
-        | <- (6,30)-(6,32)
-        | apply (6,33)-(6,38)
-          | variable (6,33)-(6,35)
-          | variable (6,36)-(6,38)
-    | = (7,3)-(7,4)
-
--}
