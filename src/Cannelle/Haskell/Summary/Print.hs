@@ -96,6 +96,7 @@ renderTypeDefinition typeDefinition =
     -- <> visibility typeDefinition.exportedTDS
     <> renderMethods typeDefinition.methodsTDS
     <> renderDerivings typeDefinition.derivingTDS
+    <> "\n"
   where
     keyword =
       case typeDefinition.kindTDS of

@@ -149,6 +149,9 @@ renderTypePrec resolver parentPrecedence annotation =
         H.LiteralTA literal ->
           (3, renderTypeLiteral resolver literal)
 
+        H.StrictTA inner ->
+          (3, "!" <> renderTypePrec resolver 0 inner)
+
         H.UnknownTA nodeName segment ->
           (3, "<unknown-type:" <> Tx.pack nodeName <> "@" <> Tx.pack (show segment) <> ">")
   in

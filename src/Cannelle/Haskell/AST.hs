@@ -299,8 +299,9 @@ data AlternativeCmt =
 
 data Alternative = Alternative {
     patternALT :: Pattern
-    , guardsALT :: [GuardContent]
-    , valueALT :: Expression
+    , guardedValuesALT :: [([GuardContent], Expression)]
+    -- , guardsALT :: [GuardContent]
+    -- , valueALT :: Expression
     , localBindsALT :: [LocalBinding]
   }
   deriving Show
@@ -440,6 +441,7 @@ data TypeAnnotation =
   | KindTA TypeAnnotation TypeAnnotation
   | WildcardTA Int
   | LiteralTA TypeLiteral
+  | StrictTA TypeAnnotation
   | UnknownTA String SegmentPos
   deriving Show
 

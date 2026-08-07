@@ -262,12 +262,14 @@ runHaskell :: Int -> TemplateSource -> DataSource -> IO ()
 runHaskell rtOpts tplSrc dataSrc = do
   rezA <- case tplSrc of
     TemplateFromFile fn -> do
-      putStrLn $ "Top level description for file: " <> fn
+      putStrLn $ "### Top level description for file: " <> fn
       -- rezB <- Hs.parse (rtOpts > 0) fn
       rezB <- Hs.parseSummary (rtOpts > 0) fn
       case rezB of
         Left errMsg -> putStrLn $ "@[runHaskell] parseSummary err: " <> show errMsg
-        Right ctxt -> HsP.printModuleSummary ctxt
+        Right ctxt -> do
+          HsP.printModuleSummary ctxt
+          putStrLn "\n\n"
     TemplateFromStdin ->
       putStrLn "@[runHaskell] TemplateFromStdin not supported yet."
   pure ()

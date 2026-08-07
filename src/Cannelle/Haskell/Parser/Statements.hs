@@ -147,8 +147,9 @@ exportSpecS = do
 
 
 exportNameS :: ScannerP ExposedSymbol
-exportNameS =
-  asum [
+exportNameS = do
+  prefixComment <- many $ S.symbol "comment"
+  result <-asum [
       do
         singlePAny [ "export", "export_name" ]
         exportContentS
@@ -158,6 +159,8 @@ exportNameS =
         _ <- optional $ S.single "module"
         ModuleNameEV <$> moduleNameS
     ]
+  postfixComment <- many $ S.symbol "comment"
+  pure result
 
 
 exportContentS :: ScannerP ExposedSymbol

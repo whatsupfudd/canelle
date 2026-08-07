@@ -123,6 +123,7 @@ whereBindingsS = S.single "where" *> localBindingsS
 
 localBindingsS :: ScannerP [LocalBinding]
 localBindingsS = do
+  prefixComment <- many $ S.symbol "comment"
   S.singleP "local_binds"
   many localBindingS
 
@@ -471,9 +472,10 @@ alternativeS = do
   S.singleP "alternative"
   alternativePattern <- patternS
   debugOpt ("alt-pat: " <> show alternativePattern) $ pure ()
-  (guards, value) <- matchValueS "->"
+  guardedValues <- some $ matchValueS "->"
   localBindings <- fromMaybe [] <$> optional whereBindingsS
-  pure . RealAlternative $ Alternative alternativePattern guards value localBindings
+  pure . RealAlternative $ Alternative alternativePattern guardedValues localBindings
+
 
 commentAlternativeS :: ScannerP AlternativeCmt
 commentAlternativeS = do

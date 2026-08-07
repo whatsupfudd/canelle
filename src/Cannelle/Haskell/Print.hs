@@ -112,6 +112,7 @@ showTypeAnnotation demandLines typeAnnotation =
       showTypeAnnotation demandLines typeValue <> " :: " <> showTypeAnnotation demandLines typeKind
     WildcardTA anInt -> "<wildcard " <> show anInt <> ">"
     LiteralTA literal -> show literal
+    StrictTA inner -> "!" <> showTypeAnnotation demandLines inner
     UnknownTA nodeName segment ->
       "<unknown-type " <> nodeName <> " " <> show segment <> ">"
 
@@ -574,12 +575,20 @@ showAlternative demandLines level alternativeCmt =
   case alternativeCmt of
     RealAlternative alternative ->
       showPattern demandLines alternative.patternALT
-        <> case alternative.guardsALT of
+        <> case alternative.guardedValuesALT of
             [] -> ""
-            guards -> " | " <> L.intercalate ", " (map (showGuard demandLines) guards)
-        <> " -> " <> showExpression demandLines (level + 1) alternative.valueALT
+            guardedValues -> L.intercalate ", " (map (showGuardedValue demandLines level) guardedValues)
         <> showLocalBindings demandLines level alternative.localBindsALT
     CommentAlternative anInt -> "-- comment " <> unrefDemand demandLines anInt
+
+
+showGuardedValue :: V.Vector String -> Int ->([GuardContent], Expression) -> String
+showGuardedValue demandLines level (guards, value) =
+  (case guards of
+    [] -> ""
+    guards -> " | " <> L.intercalate ", " (map (showGuard demandLines) guards)
+  )
+  <> " -> " <> showExpression demandLines (level + 1) value
 
 
 showLiteral :: V.Vector String -> Literal -> String

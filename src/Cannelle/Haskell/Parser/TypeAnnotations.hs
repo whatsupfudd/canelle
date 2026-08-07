@@ -33,6 +33,7 @@ typeSignatureS = debugOpt "ts-typeSignature" $ asum [
     , debugOpt "ts-wildcard" $ wildcardSignatureS
     , debugOpt "ts-literal" $ literalTypeSignatureS
     , debugOpt "ts-name" $ nameSignatureS
+    , debugOpt "ts-strict" $ strictSignatureS
     -- , debugOpt "ts-unknown" $ unknownTypeS
   ]
 
@@ -40,6 +41,11 @@ typeSignatureS = debugOpt "ts-typeSignature" $ asum [
 nameSignatureS :: ScannerP TypeAnnotation
 nameSignatureS = NameTA <$> debugOpt "ns-nameSignature" identifierS
 
+strictSignatureS :: ScannerP TypeAnnotation
+strictSignatureS = do
+  S.singleP "strict_field"
+  S.single "!"
+  StrictTA <$> typeSignatureS
 
 forallSignatureS :: ScannerP TypeAnnotation
 forallSignatureS = do
